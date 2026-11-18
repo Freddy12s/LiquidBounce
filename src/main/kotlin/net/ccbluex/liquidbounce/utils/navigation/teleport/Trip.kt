@@ -66,8 +66,9 @@ class Trip(private val owner: EventListener, private val steps: StepsValueGroup)
         destination: Vec3 = Vec3.atBottomCenterOf(goals.first()),
         reuseScores: Boolean = false,
         goalFeet: Map<BlockPos, Vec3> = emptyMap(),
+        explorationScale: Double = 1.0,
     ) {
-        val limits = RouteLimits(maxLength)
+        val limits = RouteLimits.forLength(maxLength, explorationScale)
         val goal = BlockGoal(goals)
         val stepLength = steps.stepLength
         // A seed is only valid for the same origin over the same ground; the start check stands in for the terrain,

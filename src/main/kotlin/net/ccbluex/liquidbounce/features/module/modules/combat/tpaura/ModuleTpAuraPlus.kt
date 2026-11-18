@@ -26,6 +26,7 @@ import net.ccbluex.liquidbounce.event.events.GameTickEvent
 import net.ccbluex.liquidbounce.event.events.KeybindIsPressedEvent
 import net.ccbluex.liquidbounce.event.events.KeyboardKeyEvent
 import net.ccbluex.liquidbounce.event.events.MouseButtonEvent
+import net.ccbluex.liquidbounce.event.events.OverlayRenderEvent
 import net.ccbluex.liquidbounce.event.events.PacketEvent
 import net.ccbluex.liquidbounce.event.events.RotationUpdateEvent
 import net.ccbluex.liquidbounce.event.events.WorldChangeEvent
@@ -87,14 +88,19 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * TpAuraPlus
+ * TpAuraPlus — teleport-assisted melee.
  *
- * Teleports next to enemies, attacks them, then returns or stays. Routes are found with a faster A*,
- * the destination follows the predicted position of a moving target, and the whole engagement only
- * starts once the attack cooldown will have passed on arrival — no more useless round trips.
+ * An engagement is a small state machine: pick a target, find a route to a spot near it, wait for the
+ * attack cooldown, then swing and either return home or stay. The destination is chosen from a short
+ * extrapolation of the target's measured motion; on fast targets the optional [PredictionValueGroup.aggressive]
+ * spray covers several future positions at once, because the client only sees a lagging picture of a
+ * flying player. Every swing is a two-step move: send the position on one tick and the attack on the
+ * next, so the server judges the attack from the spot it was just told about.
  *
- * The [debug] switch writes every stage to `logs/tpauraplus.log` in the game directory and mirrors
- * stage changes to chat, so an engagement can be replayed and its failures diagnosed.
+ * Debug logging writes the stage-by-stage record to `logs/tpauraplus.log`; the HUD reports the live
+ * flight estimate, hit confirmation and the current reach. The server's reach is protocol-dependent:
+ * 1.8–1.20.4 allow six blocks with line of sight and three without it, while newer versions use the
+ * `entity_interaction_range` attribute. Planning always errs toward the smaller budget.
  */
 @Suppress("TooManyFunctions")
 object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, disableOnQuit = true) {
@@ -102,7 +108,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     private val rangeValue = float("Range", 30f, 6f..100f, "blocks")
     private val range by rangeValue
     private val afterAttack by enumChoice("AfterAttack", AfterAttack.RETURN)
-    private val hold by int("Hold", 10, 1..40, "swings")
+    private val hold by int("Hold", 1, 1..40, "swings")
 
     private val prediction = tree(PredictionValueGroup())
     private val landingSide by enumChoice("LandingSide", LandingSide.ANY)
@@ -121,7 +127,8 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     private val allowThroughWall: Boolean get() = throughWall.enabled
     private val throughWallRange: Float get() = throughWall.range
 
-    private val debug by boolean("Debug", false)
+    private val hud = tree(HudValueGroup())
+    private val debug = tree(DebugValueGroup())
     private val sfx = tree(SfxValueGroup())
     private val manual = tree(ManualValueGroup())
 
@@ -145,17 +152,33 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
         tree(trip.renderer)
     }
 
-    /** How far ahead of the target the destination aims, and when it is moved again. */
+    /** Diagnostics and the search/probe budgets. */
+    private class DebugValueGroup : ValueGroup("Debug") {
+
+        /** Writes the stage-by-stage record to `logs/tpauraplus.log` and mirrors key changes to chat. */
+        val log by boolean("Log", false)
+
+        /** How much more of the terrain the A* may expand for a route; 1 keeps the engine's own budget. */
+        val pathBudget by float("PathBudget", 1f, 1f..4f, "x")
+
+        /** Upper bound on probe candidates: also used by the plain path when it picks a single spot. */
+        val maxProbes by int("MaxProbes", 8, 2..12, "probes")
+
+    }
+
     private class PredictionValueGroup : ValueGroup("Prediction") {
         val enabled by boolean("Enabled", true)
 
-        /** An upper bound on the lead; the actual lead is the measured time until the swing lands. */
+        /** Ceiling for the lead; the actual value is the rolling average of measured flight ticks. */
         val ticks by int("MaxLead", 5, 1..10, "ticks", aliases = listOf("Ticks"))
 
-        /** Moves the destination while the route is still being searched. */
+        /** Moves the destination while the route is still being searched, at most every few ticks. */
         val liveRetarget by boolean("LiveRetarget", true)
 
-        /** Swings from several spots around the target in one tick, so a landing does not hinge on one spot. */
+        /**
+         * Covers several future positions at once. Useful against fast flyers, where a single
+         * predicted spot is easily wrong by more than the server's reach.
+         */
         val aggressive by boolean("Spray", false, aliases = listOf("Aggressive"))
     }
 
@@ -237,6 +260,12 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     private class AttackGoals(val positions: List<BlockPos>, val feet: Map<BlockPos, Vec3>)
 
     private class Engagement(val target: LivingEntity) {
+        /** When the engagement began; retargets must not reset it, or the measured flight shrinks. */
+        var engageTick = -1
+
+        /** Set once the two tick attack has moved the player and is waiting to swing. */
+        var waitingSwing = false
+        var movedTick = 0
         var route: Route? = null
         var waited = 0
         var holdLeft = 0
@@ -253,8 +282,15 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
         /** Click ticks the gate turned away, to give up when the aim never lands. */
         var blockedTicks = 0
 
+        /** The goals chosen for this engagement, reused on a replan until the target has run away. */
+        var plan: AttackGoals? = null
+        var planAnchor: Vec3? = null
+
         /** Where the goals were aimed at last; a drift moves the destination. */
         var goalAnchor: Vec3? = null
+
+        /** Last tick a retarget was attempted, so the search is not restarted every tick. */
+        var retargetTick = 0
 
         /** Ticks spent searching for this engagement. */
         var searchTicks = 0
@@ -283,6 +319,22 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     private var awaitingHit: LivingEntity? = null
     private var hitWaitUntil = 0
 
+    /**
+     * Health of the target when the last swing went out, the lowest value seen since, and when to
+     * report. The minimum matters: a regenerating target heals the damage back within a few ticks.
+     */
+    private var hpCheckTarget: LivingEntity? = null
+    private var hpCheckValue = 0.0
+    private var hpCheckLowest = 0.0
+    private var hpCheckTick = 0
+
+    /** Spray-only: the forward aim recorded at send time, compared at the delayed HP check. */
+    private var aimAhead: Vec3? = null
+
+    /** When the return run began, and since when the two positions disagree — both watched for stalls. */
+    private var returnSince = 0
+    private var desyncSince = 0
+
     /** The binding whose queued press the next tick swallows, and the binding muted for that tick. */
     private var pendingSuppress: KeyMapping? = null
     private var mutedBinding: KeyMapping? = null
@@ -295,11 +347,41 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     private val targetSamples = ArrayDeque<Pair<Int, Vec3>>()
     private var samplesId = 0
 
-    /** Rolling average of the ticks from requesting a route to the swing landing. */
-    private var latencyAvg = 3.0
+    /** The last target, sampled even while the target filter excludes it. */
+    private var watchedTarget: LivingEntity? = null
+
+    /** Rolling average of the ticks from requesting a route to the swing, used as the aim lead. */
+    private var flightAvg = 3.0
+
+    /** Target and health seen last tick, to turn a drop into the damage of the last swing. */
+    private var hudTargetId = -1
+    private var hudTargetHealth = -1.0
+    private var hudLastDamage = 0.0
 
     private val reach: Double
         get() = player.entityInteractionRange() - REACH_MARGIN
+
+    /**
+     * The reach the server allows against [target] from [feet]. Both 1.8 and 1.12.2 compare the distance
+     * against six blocks when a player has line of sight to the target's eyes and three when they do not;
+     * the look direction plays no part in it.
+     */
+    private fun reachTo(feet: Vec3, target: LivingEntity): Double =
+        min(reach, if (sighted(feet, target)) SIGHTED_REACH else BLIND_REACH)
+
+    /** The server's own test: a ray from our eyes to the target's eyes, blocked by any collider. */
+    private fun sighted(feet: Vec3, target: LivingEntity): Boolean {
+        val eyes = target.position().add(0.0, target.eyeHeight.toDouble(), 0.0)
+        return world.clip(
+            ClipContext(
+                player.getEyePositionAt(feet),
+                eyes,
+                ClipContext.Block.COLLIDER,
+                ClipContext.Fluid.NONE,
+                player,
+            ),
+        ).type == HitResult.Type.MISS
+    }
 
     /** The engagement while its target is still one. */
     private val liveEngagement: Engagement?
@@ -334,6 +416,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
 
     override fun onDisabled() {
         dlog("DISABLE", TpAuraPlusLog.details("phase" to phase))
+        TpAuraPlusHud.reset()
         TeleportManager.undo(this)
         reset()
         restUntil = 0
@@ -351,6 +434,8 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     @Suppress("unused")
     private val tickHandler = handler<GameTickEvent> {
         ticks++
+        keepSampling()
+        syncHud()
 
         // The press that triggered the engagement: drop its queued click and mute the key for this
         // tick, before the game drains the click queue and reads the key states. Attacks and item
@@ -364,12 +449,74 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
 
         // A swing no hurt event answers within the window did no damage: invulnerability, reach or a
         // dead target. Only the server's own word plays the hit sound.
+        hpCheckTarget?.let { checked ->
+            val health = checked.health.toDouble()
+            if (health < hpCheckLowest) {
+                hpCheckLowest = health
+            }
+            if (ticks >= hpCheckTick) {
+                val details = TpAuraPlusLog.details(
+                    "target" to desc(checked),
+                    "before" to fmt(hpCheckValue),
+                    "lowest" to fmt(hpCheckLowest),
+                    "drop" to fmt(hpCheckValue - hpCheckLowest),
+                )
+                // The forward aim is only recorded by the spray's PREDICT line; a plain swing would
+                // otherwise report a stale error from an earlier engagement.
+                val aimed = if (sprays) aimAhead else null
+                dlog(
+                    "HP-DELTA",
+                    if (aimed != null) {
+                        details + TpAuraPlusLog.details(
+                            "aimErr" to fmt(aimed.distanceTo(checked.position())),
+                            "targetThen" to fmt(checked.position()),
+                        )
+                    } else {
+                        details
+                    },
+                )
+                hpCheckTarget = null
+            }
+        }
+
         awaitingHit?.let { waiting ->
             if (ticks > hitWaitUntil) {
                 awaitingHit = null
                 dlog("HIT-UNCONFIRMED", TpAuraPlusLog.details("target" to desc(waiting)))
+                TpAuraPlusHud.onResult(false)
             }
         }
+        // A return, or a tracked position, that never finishes leaves the player standing where the
+        // server put them — out of reach of everything and unable to move. Both get a deadline.
+        if (phase == Phase.RETURN && ticks - returnSince > RETURN_PATIENCE) {
+            dlog("RETURN-TIMEOUT", TpAuraPlusLog.details("since" to returnSince))
+            trip.reset()
+            releaseSprayPin()
+            phase = Phase.IDLE
+            engagement = null
+        }
+
+        val pinned = TeleportManager.serverPosition
+        if (pinned != null && pinned.distanceTo(player.position()) > DESYNC_GAP) {
+            if (desyncSince == 0) {
+                desyncSince = ticks
+            } else if (ticks - desyncSince > DESYNC_PATIENCE) {
+                dlog(
+                    "DESYNC-RESYNC",
+                    TpAuraPlusLog.details(
+                        "client" to fmt(player.position()),
+                        "server" to fmt(pinned),
+                        "gap" to fmt(pinned.distanceTo(player.position())),
+                    ),
+                )
+                trip.reset()
+                releaseSprayPin()
+                desyncSince = 0
+            }
+        } else {
+            desyncSince = 0
+        }
+
         if (player.isDeadOrDying || player.isSpectator || player.isPassenger) {
             leave("player-gone")
             return@handler
@@ -452,6 +599,9 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     }
 
     private fun engage() {
+        // Nothing else clears a pin left behind by a spray whose swing never went out.
+        releaseSprayPin()
+
         if (ticks < restUntil || !trip.isAvailable) {
             return
         }
@@ -480,9 +630,14 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             return
         }
 
+        watchedTarget = target
         engagement?.origin = origin
+        if (engagement?.engageTick == -1) {
+            engagement?.engageTick = ticks
+        }
         engagement?.requestTick = ticks
         view.target = target
+        TpAuraPlusHud.reason = null
         val dist = player.position().distanceTo(target.position())
         if (isHittable(origin, target)) {
             if (manual.enabled && !manualTriggered) {
@@ -538,6 +693,10 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     }
 
     private fun requestRoute(origin: Vec3, goals: AttackGoals, reuseScores: Boolean = false) {
+        if (!reuseScores) {
+            engagement?.plan = goals
+            engagement?.planAnchor = engagement?.target?.let { predictedBox(it).center }
+        }
         val anchor = engagement?.target?.let { predictedBox(it).center }
         engagement?.goalAnchor = anchor
         engagement?.searchTicks = 0
@@ -552,7 +711,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
                 "reuseScores" to reuseScores,
                 "anchor" to anchor?.let(::fmt),
                 "lead" to engagement?.target?.let { fmt(leadTicks(it)) },
-                "latency" to fmt(latencyAvg),
+                "flightEMA" to fmt(flightAvg),
             ),
         )
         trip.request(
@@ -561,6 +720,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             maxLength = range * ROUTE_DETOUR,
             reuseScores = reuseScores,
             goalFeet = goals.feet,
+            explorationScale = debug.pathBudget.toDouble(),
         )
         phase = Phase.ROUTING
     }
@@ -568,6 +728,44 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     private fun route() {
         val engagement = liveEngagement ?: return leave("target-lost-while-routing")
         engagement.searchTicks++
+
+        // A search that runs this long is not slow, it is stuck: the origin drifted away from where the
+        // server has the player and no route will ever come out of it.
+        if (engagement.searchTicks > SEARCH_PATIENCE) {
+            dlog(
+                "SEARCH-TIMEOUT",
+                TpAuraPlusLog.details(
+                    "searchTick" to engagement.searchTicks,
+                    "playerDrift" to fmt(playerDrift(engagement)),
+                ),
+            )
+            return leave("search-timeout")
+        }
+
+        // The route is planned from the position the pin claims the server has. When the server never
+        // took that spot the origin is fiction and no route comes out of it: the client sits dozens of
+        // blocks away while the search looks for a way out of a place nobody is standing in. Detected on
+        // the *current* belief, after a few ticks of searching, so it cannot fire in a loop.
+        val pinned = TeleportManager.serverPosition
+        if (pinned != null && engagement.searchTicks > RESYNC_AFTER) {
+            val drift = pinned.distanceTo(player.position())
+            if (drift > DESYNC_GAP) {
+                dlog(
+                    "ORIGIN-RESYNC",
+                    TpAuraPlusLog.details(
+                        "client" to fmt(player.position()),
+                        "believed" to fmt(pinned),
+                        "drift" to fmt(drift),
+                        "searchTick" to engagement.searchTicks,
+                    ),
+                )
+                trip.reset()
+                releaseSprayPin()
+                engagement.searchTicks = 0
+                return replan("origin-resync")
+            }
+        }
+
         updateDestination(engagement)
         when (val result = trip.poll()) {
             RouteResult.Searching -> {
@@ -626,15 +824,10 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             1
         }
 
-        // The destination was aimed at the target for the moment of arrival; check it against the
-        // target for that moment, not for a full lead from now — that counts the lead twice.
-        if (!isDestinationInReach(route.destination, engagement.target, arrival + STATE_TICKS)) {
-            dlog(
-                "READY-DESTINATION-OUT-OF-REACH",
-                TpAuraPlusLog.details("targetDist" to fmt(targetDist(engagement))),
-            )
-            return replan("destination-out-of-reach")
-        }
+        // There used to be a reach check here, before the route was even flown. Against a fast target
+        // the destination is meant to be out of reach of the target's *current* position — it is aimed
+        // where the target will be — so the gate rejected almost every dispatch before it started.
+        // The real check happens on arrival; do not pre-judge the landing spot here.
 
         if (manual.enabled) {
             if (!manualTriggered) {
@@ -769,11 +962,26 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
         val engagement = engagement
         engagement?.run {
             if (requestTick > 0) {
-                latencyAvg = latencyAvg * 0.6 + (ticks - requestTick) * 0.4
+                // From the request, not the engagement: the landing spot was predicted from the request,
+                // so the ticks it takes from there to the swing are what the target travels unaccounted.
+                val measured = (ticks - requestTick).toDouble()
+                dlog(
+                    "LATENCY",
+                    TpAuraPlusLog.details(
+                        "measured" to fmt(measured),
+                        "before" to fmt(flightAvg),
+                        "after" to fmt(flightAvg * 0.6 + measured * 0.4),
+                        "engageTick" to engageTick,
+                        "requestTick" to requestTick,
+                        "ticks" to ticks,
+                    ),
+                )
+                flightAvg = flightAvg * 0.6 + measured * 0.4
             }
             holdLeft = hold
             attacked = false
-            retries = 0
+            // Retries are NOT reset here: this runs on every arrival, and zeroing the budget there made
+            // MAX_RETRIES unreachable — the engagement replanned in circles instead of giving up.
             idleTicks = 0
             blockedTicks = 0
             goalAnchor = predictedBox(target).center
@@ -801,8 +1009,39 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
 
         val engagement = liveEngagement ?: return leave("attack-over")
         val target = engagement.target
-        val feet = trip.feet
+        // Where the server has us. The spray moves without a trip, so trip.feet would still be the
+        // route destination and every swing from a probe would be written off as out of reach.
+        val feet = TeleportManager.serverPosition ?: trip.feet
+        if (!sprays) {
+            val eyes = player.getEyePositionAt(feet)
+            dlog(
+                "PLAIN-AIM",
+                TpAuraPlusLog.details(
+                    "feet" to fmt(feet),
+                    "target" to fmt(target.position()),
+                    "dist" to fmt(target.boundingBox.distanceToSqr(eyes).let { sqrt(it) }),
+                    "predDist" to fmt(predictedBox(target).distanceToSqr(eyes).let { sqrt(it) }),
+                    "reach" to fmt(reachTo(feet, target)),
+                    "speed" to fmt(trackedVelocity(target)?.length() ?: 0.0),
+                    "lead" to fmt(leadTicks(target)),
+                    "ping" to player.ping,
+                    "pin" to (TeleportManager.serverPosition?.let { "yes" } ?: "no"),
+                    "ticks" to (ticks - engagement.requestTick),
+                ),
+            )
+        }
         if (!isInReach(feet, target)) {
+            // A plain swing has no probe chain to get there, but it can still move to a freshly aimed
+            // spot once before giving up. This has to happen here, ahead of the gate: the reach of the
+            // route destination says nothing about the reach of the spot we are about to stand on.
+            if (!sprays && !engagement.waitingSwing && attackReady()) {
+                val mode = if (attackWithoutSwing) SwingMode.HIDE_SERVER else SwingMode.DO_NOT_HIDE
+                if (deliver(target, mode)) {
+                    engagement.attacked = true
+                }
+                return
+            }
+
             // The aggressive spray flies to the target on its own: give it the swing before the spot
             // is written off and the route planned again.
             val sprayable = sprays && attackReady()
@@ -830,20 +1069,21 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             // The protocol takes the attack packet without a look or a click: it goes out as soon as
             // the weapon is ready again, the cooldown pacing being the only limit that matters.
             if (attackReady()) {
-                deliver(target, swingMode)
-                engagement.attacked = true
-                engagement.idleTicks = 0
-                dlog(
-                    "HIT",
-                    TpAuraPlusLog.details(
-                        "target" to desc(target),
-                        "dist" to fmt(targetDist(engagement)),
-                        "holdLeft" to engagement.holdLeft,
-                    ),
-                )
-                if (afterAttack == AfterAttack.RETURN && --engagement.holdLeft <= 0) {
-                    dlog("HOLD-EXPIRED")
-                    leave("hold-expired")
+                if (deliver(target, swingMode)) {
+                    engagement.attacked = true
+                    engagement.idleTicks = 0
+                    dlog(
+                        "HIT",
+                        TpAuraPlusLog.details(
+                            "target" to desc(target),
+                            "dist" to fmt(targetDist(engagement)),
+                            "holdLeft" to engagement.holdLeft,
+                        ),
+                    )
+                    if (afterAttack == AfterAttack.RETURN && --engagement.holdLeft <= 0) {
+                        dlog("HOLD-EXPIRED")
+                        leave("hold-expired")
+                    }
                 }
             } else {
                 dlog("ATTACK-COOLDOWN", TpAuraPlusLog.details("progress" to fmt(cooldownProgress())))
@@ -861,7 +1101,9 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
 
         if (executed) {
             clicker.click {
-                deliver(target, swingMode)
+                if (!deliver(target, swingMode)) {
+                    return@click false
+                }
                 engagement.attacked = true
                 dlog(
                     "HIT",
@@ -920,6 +1162,12 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             return
         }
 
+        // A retarget restarts the search and resets the latency measurement, so doing it every tick keeps
+        // the route from ever settling. One attempt per few ticks is enough to follow a moving target.
+        if (ticks - engagement.retargetTick < RETARGET_COOLDOWN) {
+            return
+        }
+
         val anchor = engagement.goalAnchor ?: return
         val predicted = predictedBox(engagement.target).center
         val drift = predicted.distanceTo(anchor)
@@ -932,8 +1180,13 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             return
         }
 
+        engagement.retargetTick = ticks
         val goals = attackPositions(engagement.target, trip.feet)
         val retargeted = goals.positions.isNotEmpty() && trip.retarget(goals.positions, goals.feet)
+        if (retargeted) {
+            engagement.plan = goals
+            engagement.planAnchor = predicted
+        }
         dlog(
             "RETARGET",
             TpAuraPlusLog.details(
@@ -951,7 +1204,14 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     private fun replan(reason: String) {
         val target = engagement?.target ?: return leave("target-lost-on-replan")
         val origin = trip.feet
-        val goals = attackPositions(target, origin)
+
+        // The goals were picked once, around the target's predicted position; computing them again on
+        // every replan walks the destination forward each time and the route never converges.
+        val predicted = predictedBox(target).center
+        val stale = engagement?.planAnchor?.let { it.distanceTo(predicted) > GOAL_DRIFT } ?: true
+        val goals = if (stale) attackPositions(target, origin) else engagement?.plan!!
+        engagement?.plan = goals
+        engagement?.planAnchor = predicted
         if (goals.positions.isEmpty()) {
             dlog("REPLAN-NO-GOALS", TpAuraPlusLog.details("reason" to reason, "target" to desc(target)))
             return leave("no-goals-on-replan")
@@ -972,6 +1232,8 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             return
         }
 
+        TpAuraPlusHud.reason = reason
+
         if (phase == Phase.ATTACK && engagement?.attacked != true) {
             sfx(sfx.hitFail, SFX_HIT)
         }
@@ -990,6 +1252,13 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             ),
         )
         phase = if (trip.comeBack()) Phase.RETURN else Phase.IDLE
+        if (phase == Phase.RETURN) {
+            returnSince = ticks
+        }
+        if (phase != Phase.RETURN) {
+            // Only when nothing comes back: a return run needs the position it is standing on.
+            releaseSprayPin()
+        }
         engagement = null
         // The hurt event of a swing still in flight may arrive after the engagement ended; the wait
         // is kept on purpose, so the sound is not lost on the way home.
@@ -1007,6 +1276,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
                 "targetOnGround" to target.onGround(),
             ),
         )
+        TpAuraPlusHud.reason = reason
         unreachable.put(target.id, ticks + UNREACHABLE_TICKS)
         view.invalid()
         view.target = null
@@ -1017,6 +1287,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
 
     /** The server set the player back, so it gets some rest before trying again. */
     private fun rejected() {
+        TpAuraPlusHud.reason = "setback"
         sfx(sfx.serverSetback, SFX_SETBACK)
         dlog("REJECTED", TpAuraPlusLog.details("client" to fmt(player.position()), "server" to fmt(trip.feet)))
         reset()
@@ -1025,6 +1296,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     }
 
     private fun reset() {
+        releaseSprayPin()
         trip.reset()
         phase = Phase.IDLE
         engagement = null
@@ -1098,38 +1370,53 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             return target.boundingBox
         }
 
-        // A circling target curves away from the straight lead: rotate the velocity by half the
-        // turn it makes while we travel, so the aim lands on the arc instead of its tangent.
+        // A circling target curves away from the straight lead: rotate the velocity by half the turn it
+        // makes while we travel, so the aim lands on the arc instead of its tangent. A sharp corner is
+        // not an arc: there the newest direction is all the truth there is, and the turn must not shrink
+        // the lead — that shortened it to a tick or two right after every corner of a square path.
         val omega = trackedTurn(target)
-        val capped = if (abs(omega) < 1.0E-4) lead else min(lead, MAX_TURN / abs(omega))
-        val turn = omega * capped * TURN_DAMP / 2.0
-        val offset = rotateY(velocity, turn).scale(capped)
+        val offset = if (abs(omega) > SHARP_TURN) {
+            velocity.scale(lead)
+        } else {
+            val turn = (omega * lead * TURN_DAMP / 2.0).coerceIn(-MAX_TURN, MAX_TURN)
+            rotateY(velocity, turn).scale(lead)
+        }
         return target.boundingBox.move(offset)
     }
 
     private fun predictedBox(target: LivingEntity): AABB = predictedBox(target, leadTicks(target))
 
     /**
-     * Ticks of lead when aiming: the measured ticks left until the swing lands — never past the
-     * setting, never past what [MAX_TURN] of turning admits. The latency is measured, not guessed:
-     * every swing reports how long the engagement really took.
+     * Ticks of lead when aiming: the rolling average of the ticks a route actually took from request
+     * to swing, capped by the configured maximum. The cap is a safety rail, not a target — on a fast
+     * target with a short flight the measured value settles near three ticks. A fixed offset for the
+     * client's interpolation was tried and dropped: the visible target can be anywhere from five to
+     * twenty blocks behind a fast flying player, so one constant cannot compensate for it.
      */
-    private fun leadTicks(target: LivingEntity): Double {
-        val base = min(prediction.ticks.toDouble(), remainingEta())
-        val omega = abs(trackedTurn(target))
-        return if (omega < 1.0E-4) base else min(base, MAX_TURN / omega)
-    }
-
-    /** Ticks from now until the swing lands, from the rolling average of what past engagements took. */
-    private fun remainingEta(): Double {
-        val engagement = engagement ?: return prediction.ticks.toDouble()
-        return max(1.0, latencyAvg - (ticks - engagement.requestTick))
+    private fun leadTicks(@Suppress("UNUSED_PARAMETER") target: LivingEntity): Double {
+        // The lead is the flight actually measured from request to swing — the ticks the target travels
+        // unaccounted — with the setting as its ceiling, so a bad measurement cannot overshoot. A fixed
+        // value was always wrong at one end: the flight moves between four and six ticks on its own.
+        // Measured flight only. A fixed interpolation offset was tried and hurt the verified spray
+        // tuning: the client can be anywhere from five to twenty blocks behind a fast target, so one
+        // constant cannot compensate for it, and shifting every goal broke the spray that already worked.
+        return flightAvg.coerceIn(MIN_LEAD, prediction.ticks.toDouble())
     }
 
     // --- Target tracking ---
     //
     // The delta movement of a remote player is not synced — its positions come from move packets —
     // so the velocity the prediction needs is measured from the positions ourselves.
+
+    /** Keeps sampling the last watched target while it is only filtered out, so a hurt time leaves no gap. */
+    private fun keepSampling() {
+        val watched = watchedTarget ?: return
+        if (!watched.isAlive || watched.isRemoved) {
+            watchedTarget = null
+            return
+        }
+        sampleTarget(watched)
+    }
 
     private fun sampleTarget(target: LivingEntity) {
         val id = target.id
@@ -1146,9 +1433,36 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
         }
     }
 
+    /**
+     * The trailing run of samples taken on consecutive ticks. Sampling pauses while the target is filtered
+     * out (its hurt time), and a buffer spanning that gap turns the arc it walked into a chord, which
+     * understates the speed.
+     */
+    private fun contiguousRun(): List<Pair<Int, Vec3>>? {
+        val samples = targetSamples
+        if (samples.size < 2) {
+            return null
+        }
+
+        var start = samples.size - 1
+        while (start > 0 && samples[start].first - samples[start - 1].first == 1) {
+            start--
+        }
+        return samples.subList(start, samples.size)
+    }
+
     /** Blocks per tick over the last [SPEED_WINDOW] ticks, or null when the target is too new. */
     private fun trackedVelocity(target: LivingEntity): Vec3? {
-        val samples = targetSamples.takeIf { it.size >= 2 && samplesId == target.id } ?: return null
+        val samples = contiguousRun()?.takeIf { samplesId == target.id } ?: return null
+
+        // Right after a corner the window still holds the old direction; the newest step is the only one
+        // that points where the target is actually going.
+        if (samples.size >= 3 && isSharpCorner(samples)) {
+            val last = samples[samples.size - 1]
+            val previous = samples[samples.size - 2]
+            val elapsed = (last.first - previous.first).toDouble()
+            return if (elapsed < 1.0) null else last.second.subtract(previous.second).scale(1.0 / elapsed)
+        }
         val (endTick, endPos) = samples.last()
         val (startTick, startPos) = samples.firstOrNull { endTick - it.first >= SPEED_WINDOW } ?: samples.first()
         val elapsed = (endTick - startTick).toDouble()
@@ -1159,14 +1473,31 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     }
 
     /** Radians per tick the target turns around its up axis, from the same samples as [trackedVelocity]. */
-    private fun trackedTurn(target: LivingEntity): Double {
-        val samples = targetSamples.takeIf { it.size >= 3 && samplesId == target.id } ?: return 0.0
-        val (endTick, endPos) = samples.last()
-        val mid = samples.firstOrNull { endTick - it.first >= SPEED_WINDOW } ?: return 0.0
-        val start = samples.firstOrNull { mid.first - it.first >= SPEED_WINDOW } ?: return 0.0
+    /** Whether the last two steps of [samples] disagree by more than a sharp turn. */
+    private fun isSharpCorner(samples: List<Pair<Int, Vec3>>): Boolean {
+        val last = samples[samples.size - 1].second.subtract(samples[samples.size - 2].second)
+        val before = samples[samples.size - 2].second.subtract(samples[samples.size - 3].second)
+        if (last.lengthSqr() < MIN_PREDICT_VELOCITY_SQ || before.lengthSqr() < MIN_PREDICT_VELOCITY_SQ) {
+            return false
+        }
+        val angle = atan2(
+            before.x * last.z - before.z * last.x,
+            before.x * last.x + before.z * last.z,
+        )
+        return abs(angle) > SHARP_TURN
+    }
 
-        val newer = endPos.subtract(mid.second)
-        val older = mid.second.subtract(start.second)
+    private fun trackedTurn(target: LivingEntity): Double {
+        // Three consecutive samples are enough. Waiting for two windows of SPEED_WINDOW ticks meant the
+        // estimate came back as zero whenever the target entity id changed, which it does constantly —
+        // and a zero turn means a circling target is extrapolated as a straight line.
+        val run = contiguousRun()?.takeIf { it.size >= 3 && samplesId == target.id } ?: return 0.0
+        val last = run[run.size - 1]
+        val mid = run[run.size - 2]
+        val first = run[run.size - 3]
+
+        val newer = last.second.subtract(mid.second)
+        val older = mid.second.subtract(first.second)
         if (newer.lengthSqr() < MIN_PREDICT_VELOCITY_SQ || older.lengthSqr() < MIN_PREDICT_VELOCITY_SQ) {
             return 0.0
         }
@@ -1175,7 +1506,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             older.x * newer.z - older.z * newer.x,
             older.x * newer.x + older.z * newer.z,
         )
-        return angle / (endTick - start.first).coerceAtLeast(1)
+        return angle / (last.first - first.first).coerceAtLeast(1)
     }
 
     private fun rotateY(v: Vec3, angle: Double): Vec3 {
@@ -1188,30 +1519,15 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     }
 
     private fun isInReach(feet: Vec3, target: LivingEntity) =
-        target.boundingBox.distanceToSqr(player.getEyePositionAt(feet)) <= Mth.square(reach)
+        target.boundingBox.distanceToSqr(player.getEyePositionAt(feet)) <= Mth.square(reachTo(feet, target))
 
     /**
      * Whether the target can be hit from here without moving: in reach and not hidden. A wall a few
      * blocks away is not a reason to skip the route — it may be climbed over.
      */
-    private fun isHittable(feet: Vec3, target: LivingEntity): Boolean {
-        if (!isInReach(feet, target)) {
-            return false
-        }
-        val eyes = player.getEyePositionAt(feet)
-        return hasClearSight(eyes, target.boundingBox.center) || throughWall(eyes, target.boundingBox)
-    }
-
-    /**
-     * Whether the destination still reaches the target at [arrivalLead] ticks from now — where it is
-     * now or where it is heading by then. A jinking target may swing back in as often as out.
-     */
-    private fun isDestinationInReach(feet: Vec3, target: LivingEntity, arrivalLead: Double): Boolean {
-        val eyes = player.getEyePositionAt(feet)
-        val limit = Mth.square(reach)
-        return target.boundingBox.distanceToSqr(eyes) <= limit ||
-            predictedBox(target, arrivalLead).distanceToSqr(eyes) <= limit
-    }
+    private fun isHittable(feet: Vec3, target: LivingEntity): Boolean =
+        isInReach(feet, target) || (throughWall(player.getEyePositionAt(feet), target.boundingBox) &&
+            target.boundingBox.distanceToSqr(player.getEyePositionAt(feet)) <= Mth.square(BLIND_REACH))
 
     /** Whether the rotation the server has is on where the target is heading — loosely, to swing. */
     private fun isFacing(eyes: Vec3, target: LivingEntity): Boolean {
@@ -1258,6 +1574,61 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
         return false
     }
 
+    /**
+     * Orders the spots into a nearest-first tour. There is no distance cut-off: the servers this module
+     * is built for accept long hops, and dropping the far spots here used to leave an engagement with
+     * nothing to teleport to while it spun in ATTACK for ever.
+     */
+    private fun legalHops(spots: List<Pair<BlockPos, Vec3>>): List<Pair<BlockPos, Vec3>> {
+        var cursor = TeleportManager.serverPosition ?: player.position()
+        val remaining = spots.toMutableList()
+        val ordered = ArrayList<Pair<BlockPos, Vec3>>(spots.size)
+
+        while (remaining.isNotEmpty()) {
+            val next = remaining.minByOrNull { (_, feet) -> feet.distanceToSqr(cursor) } ?: break
+            ordered += next
+            remaining.remove(next)
+            cursor = next.second
+        }
+        return ordered
+    }
+
+    /**
+     * Hands the position back to the client. The spray pins it to hold a probe spot, and a pin that
+     * outlives the swing leaves the server standing where the player is not.
+     */
+    private fun releaseSprayPin() {
+        val pinned = TeleportManager.holds(this) || TeleportManager.serverPosition != null
+        if (!pinned && trip.run == null) {
+            return
+        }
+
+        // A run that never finished owns the position and would rewrite the client's movement for ever:
+        // drop it first, then hand the position back so the server follows the player again.
+        trip.reset()
+        TeleportManager.forceRelease(this)
+
+        sendPacketSilently(ServerboundMovePlayerPacket.Pos(player.position(), player.onGround(), false))
+        TeleportManager.releasePosition()
+    }
+
+    /** The single spot closest to where the target is, or null when the spray found none. */
+    private fun spotFor(target: LivingEntity): Pair<BlockPos, Vec3>? {
+        // The aggressive spray was tuned against the drawn position, and that behaviour is kept for it:
+        // the chain below covers the forward error on its own. Plain strikes have no such chain, so they
+        // must pick the spot nearest where the target will actually be instead.
+        return if (sprays) {
+            legalHops(probeSpots(target)).minByOrNull { (_, feet) ->
+                target.boundingBox.distanceToSqr(player.getEyePositionAt(feet))
+            }
+        } else {
+            val aim = predictedBox(target, leadTicks(target)).center
+            legalHops(probeSpots(target)).minByOrNull { (_, feet) -> feet.distanceToSqr(aim) }
+        }
+    }
+
+    private fun terrainOnGround(pos: BlockPos): Boolean = Terrain.live().feet(pos) != null
+
     /** Landing spots around the predicted box of [target], hovering ones preferred when it flies. */
     private fun attackPositions(target: LivingEntity, from: Vec3): AttackGoals {
         val box = predictedBox(target)
@@ -1268,9 +1639,12 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
         // Against a target in the air, hovering next to it beats standing far below; against one on
         // the ground, a foothold stays first and hovering is only the fallback.
         val hoverFirst = airTargets && !target.onGround()
+        // Land close, not at the edge of the budget: the target keeps moving for the ticks the route
+        // takes, and a spot at five blocks is out of reach by the time the player stands on it. The
+        // wider sighted budget is for judging the swing, not for choosing where to land.
         val candidates = terrain.reachFeetPositions(
             box,
-            reach - TARGET_MOVEMENT_MARGIN,
+            min(reach, BLIND_REACH) - TARGET_MOVEMENT_MARGIN,
             from,
             allowAir = airTargets,
             wallsRange = if (allowThroughWall) throughWallRange.toDouble() else 0.0,
@@ -1287,30 +1661,118 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     }
 
     /**
-     * Delivers the swing. Normally one attack packet; with the aggressive spray, attacks from
-     * several spots around the target within the same tick — the server checks reach for each of
-     * them in order, drops the ones out of range without spending the cooldown and takes the first
-     * that connects, so the hit does not hinge on one predicted spot being exact.
+     * Delivers this tick's action. The two-tick move sends only a position packet and returns; the next
+     * tick sends the attack. With the aggressive spray the same tick then sends a chain of positions
+     * and attacks, covering several possible future positions of the target. Returns whether a swing
+     * actually went out, which is what the caller charges to the cooldown and hit confirmation.
      */
-    private fun deliver(target: LivingEntity, swingMode: SwingMode) {
+    private fun deliver(target: LivingEntity, swingMode: SwingMode): Boolean {
+        // The two-tick attack: a position on one tick, a swing on the next. The server has to stand on
+        // the spot before judging the attack; a move and an attack in the same tick leave it judging
+        // from the old position, which cost most of the hits.
+        run {
+            val engagement = engagement
+            if (!sprays && engagement?.waitingSwing != true && isInReach(trip.feet, target)) {
+                // Already standing within reach: swing right here. No position packet, no delay, and no
+                // reason to move — this is the walking, in-reach case that always hit.
+                engagement?.waitingSwing = false
+            } else if (engagement != null && !engagement.waitingSwing) {
+                // Move now, swing next tick: the position has to be on the server before the attack.
+                val spot = spotFor(target) ?: run {
+                    dlog("NO-SPOT", TpAuraPlusLog.details("dist" to fmt(targetDist(engagement))))
+                    if (engagement.retries++ >= MAX_RETRIES) {
+                        leave("no-spot")
+                    }
+                    return false
+                }
+                val onGround = terrainOnGround(spot.first)
+                // Pin as well, so the position the gate reads next tick is the one we sent.
+                TeleportManager.notePosition(spot.second, onGround, TELEPORT_PIN_TICKS)
+                sendPacketSilently(ServerboundMovePlayerPacket.Pos(spot.second, onGround, false))
+                engagement.waitingSwing = true
+                engagement.movedTick = ticks
+                dlog("TWO-TICK", TpAuraPlusLog.details("feet" to fmt(spot.second)))
+                return false
+            }
+            if (engagement != null && ticks - engagement.movedTick < SWING_DELAY) {
+                return false
+            }
+            engagement?.waitingSwing = false
+        }
+
         awaitHit(target)
+
+        hpCheckTarget = target
+        hpCheckValue = target.health.toDouble()
+        hpCheckLowest = hpCheckValue
+        // The swing lands about a lead later, so the window has to cover that; three ticks missed the
+        // damage of the far-aimed swings and reported them as misses.
+        hpCheckTick = ticks + leadTicks(target).toInt() + 2
+
+        // Reset per swing: the strip keeps the last spray visible, a plain swing must not inherit it.
+        TpAuraPlusHud.sprayMax = debug.maxProbes
+        TpAuraPlusHud.spraySpots = 0
 
         if (!sprays) {
             attackEntity(target, swingMode, keepSprint = true)
             clicker.itemCooldown?.newCooldown()
-            return
+            return true
         }
 
         val spots = probeSpots(target)
         if (spots.isEmpty()) {
-            attackEntity(target, swingMode, keepSprint = true)
-            clicker.itemCooldown?.newCooldown()
-            return
+            // No spot means there is nowhere to stand within reach: a swing from here would only be
+            // dropped by the server. Count it and let the next tick plan again instead.
+            val engagement = engagement
+            dlog(
+                "NO-SPOT",
+                TpAuraPlusLog.details("dist" to (engagement?.let { fmt(targetDist(it)) } ?: "-")),
+            )
+            if (engagement == null || engagement.retries++ >= MAX_RETRIES) {
+                leave("no-spot")
+            }
+            return false
         }
 
-        for ((_, feet) in spots) {
-            sendPacketSilently(ServerboundMovePlayerPacket.Pos(feet, false, false))
-            attackEntity(target, swingMode, keepSprint = true)
+        var sent = 0
+        val terrain = Terrain.live()
+        val hops = legalHops(spots)
+        val toSend = hops
+        // The aim is only as good as where the target turns out to be once the flight is over, so the
+        // comparison is deferred: this line records what we aimed at, HP-DELTA reports the landing.
+        spots.lastOrNull()?.let { (_, aim) ->
+            val actual = target.position()
+            aimAhead = predictedBox(target, leadTicks(target)).center
+            dlog(
+                "PREDICT",
+                TpAuraPlusLog.details(
+                    "aim" to fmt(aim),
+                    "targetNow" to fmt(actual),
+                    "offset" to fmt(aim.distanceTo(actual)),
+                    "vel" to (trackedVelocity(target)?.let { fmt(it) } ?: "none"),
+                    "omega" to fmt(trackedTurn(target)),
+                    "speed" to fmt(trackedVelocity(target)?.length() ?: 0.0),
+                    "flight" to (engagement?.let { ticks - it.requestTick } ?: -1),
+                    "lead" to (engagement?.target?.let { fmt(leadTicks(it)) } ?: "-"),
+                ),
+            )
+        }
+
+        for ((pos, feet) in toSend) {
+            // The flag has to match the spot: the server rejects a move that claims to be airborne
+            // above ground of its own accord, and the attack after it is judged from the old position.
+            val onGround = terrain.feet(pos) != null
+            // Pin first: the vanilla client sends its own position every tick, and one of those packets
+            // arriving between the teleport and the swing puts the server back where the player really
+            // stands — far from the target — so the attack is judged out of reach.
+            TeleportManager.notePosition(feet, onGround, TELEPORT_PIN_TICKS)
+            sendPacketSilently(ServerboundMovePlayerPacket.Pos(feet, onGround, false))
+            if (attackEntity(target, swingMode, keepSprint = true)) {
+                sent++
+            }
+        }
+        if (sent == 0) {
+            dlog("SPRAY-BLOCKED", TpAuraPlusLog.details("spots" to spots.size))
         }
 
         clicker.itemCooldown?.newCooldown()
@@ -1320,6 +1782,8 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             // Nothing owns the tracked position in the in-reach engagement: no run was started, so no
             // return will ever clean it up and the server would stand on the last probe spot while the
             // player walks away. Put the server back on the client and stop rewriting its movement.
+            TpAuraPlusHud.spraySpots = spots.size
+            TpAuraPlusHud.sprayMax = debug.maxProbes
             val owned = TeleportManager.holds(this)
             if (!owned) {
                 sendPacketSilently(
@@ -1337,10 +1801,12 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
                         "client" to fmt(player.position()),
                         "gap" to fmt(player.position().distanceTo(feet)),
                         "spots" to spots.size,
+                        "max" to debug.maxProbes,
                     ),
                 )
             }
         }
+        return true
     }
 
     /**
@@ -1354,19 +1820,63 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
 
         // How long until the packets are processed: the base window plus half the ping.
         val window = PROBE_TICKS + min(player.ping / 2.0 / 50.0, PROBE_PING_CAP)
+        val maxProbes = debug.maxProbes
+        // Neighbours stay within two blind reaches of each other, so the spot between them still lands
+        // even where the sight line is blocked — the conservative budget, not the sighted one.
+        val spacing = 2.0 * BLIND_REACH * SPRAY_COVERAGE
+        // The chain reaches back as well as forward: the server still has the target where it was a
+        // tick or two ago, so a spot only placed ahead of the client's view misses it entirely.
+        val span = window + PROBE_BACK
         val steps = if (speed * speed < MIN_PREDICT_VELOCITY_SQ) {
             1
         } else {
-            min(CHAIN_MAX, max(1, ceil(speed * window / CHAIN_STEP).toInt()))
+            min(max(1, ceil(speed * span / spacing).toInt()), maxProbes / 2)
         }
 
-        val spots = ArrayList<Pair<BlockPos, Vec3>>(MAX_PROBES)
+        // The swing lands a tick later than the teleport, so the chain moves forward by that delay: the
+        // server judges the swing against where the target is by then.
+        val base = SWING_DELAY + 1.0
+
+        val spots = ArrayList<Pair<BlockPos, Vec3>>(maxProbes)
         for (step in 0..steps) {
-            val point = predictedBox(target, window * step / steps).center
+            val point = predictedBox(target, base - PROBE_BACK + span * step / steps).center
             addProbe(spots, terrain, point)
             addProbe(spots, terrain, point.add(0.0, 1.0, 0.0))
         }
-        return spots.distinctBy { it.first }.take(MAX_PROBES)
+
+        val result = spots.distinctBy { it.first }.take(maxProbes)
+
+        // How close the spots actually are to the target right now: if these are small and the server
+        // still drops the swings, the error is not in the prediction.
+        val distances = result.map {
+            target.boundingBox.distanceToSqr(player.getEyePositionAt(it.second))
+        }
+        dlog(
+            "SPRAY",
+            TpAuraPlusLog.details(
+                "probeMin" to fmt(sqrt(distances.minOrNull() ?: 0.0)),
+                "probeMax" to fmt(sqrt(distances.maxOrNull() ?: 0.0)),
+                // Every probe in order: if none of them is close, the chain missed; if one is and the
+                // server still says nothing, the packets are the problem.
+                "probes" to distances.joinToString(",") { fmt(sqrt(it)) },
+                "sent" to legalHops(result).size,
+                "delay" to SWING_DELAY,
+                "ping" to player.ping,
+                "target" to desc(target),
+                "speed" to fmt(speed),
+                "samples" to targetSamples.size,
+                "window" to fmt(window),
+                "steps" to steps,
+                "gap" to fmt(if (steps > 0) speed * span / steps else 0.0),
+                "back" to fmt(PROBE_BACK),
+                "base" to fmt(base),
+                "spots" to result.size,
+                "candidates" to spots.size,
+                "max" to maxProbes,
+                "spacing" to fmt(spacing),
+            ),
+        )
+        return result
     }
 
     private fun addProbe(spots: MutableList<Pair<BlockPos, Vec3>>, terrain: Terrain, point: Vec3) {
@@ -1449,17 +1959,75 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             TeleportManager.MAX_DRIFT + playerSpeed() * (engagement.searchTicks + 1),
         ).coerceAtMost(DRIFT_CAP)
 
-    /** Ticks a hurt event may take: one for the round trip plus the ping. Kept short on purpose. */
-    private fun hitConfirmWindow(): Int = (1 + player.ping / 50).coerceIn(2, 6)
+    /**
+     * How long the server's word may take. The damage event travels back over the same RTT the swing
+     * took, so a window of one RTT plus a tick of server time is the minimum; a tighter one reports a
+     * landed hit as a miss.
+     */
+    private fun hitConfirmWindow(): Int = (2 + player.ping / 50).coerceIn(3, 10)
+
+    @Suppress("unused")
+    private val hudHandler = handler<OverlayRenderEvent> { event ->
+        TpAuraPlusHud.render(event.context, hud)
+    }
+
+    /** Feeds the HUD strip from the values the debug log already computes. */
+    private fun syncHud() {
+        val target = engagement?.target
+
+        // Health is sampled every tick, so one drop between ticks is what the last swing took. A target
+        // that leaves keeps its numbers, otherwise the damage would vanish the moment the module idles.
+        if (target != null && target.id != hudTargetId) {
+            hudTargetId = target.id
+            hudTargetHealth = -1.0
+            hudLastDamage = 0.0
+        }
+        if (target != null) {
+            val health = target.health.toDouble()
+            if (hudTargetHealth >= 0.0 && health < hudTargetHealth) {
+                hudLastDamage = hudTargetHealth - health
+            }
+            hudTargetHealth = health
+            TpAuraPlusHud.targetHealth = health
+            TpAuraPlusHud.targetMaxHealth = target.maxHealth.toDouble()
+        }
+        TpAuraPlusHud.lastDamage = hudLastDamage
+
+        TpAuraPlusHud.phase = phase.name
+        TpAuraPlusHud.target = target?.name?.string
+        TpAuraPlusHud.distance = engagement?.let { targetDist(it) } ?: 0.0
+        TpAuraPlusHud.lead = target?.let { leadTicks(it) } ?: 0.0
+        TpAuraPlusHud.flightEma = flightAvg
+        TpAuraPlusHud.waypoints = engagement?.route?.points?.size?.minus(1) ?: 0
+        TpAuraPlusHud.routeLength = engagement?.route?.let { Route.lengthOf(it.points) } ?: 0.0
+        TpAuraPlusHud.searchTicks = engagement?.searchTicks ?: 0
+        TpAuraPlusHud.drift = engagement?.route?.let { it.start.distanceTo(player.position()) } ?: 0.0
+        // While a trip holds the position the divergence is the point of the trip, not a warning.
+        TpAuraPlusHud.pinGap = if (TeleportManager.holds(this)) {
+            0.0
+        } else {
+            TeleportManager.serverPosition?.let { it.distanceTo(player.position()) } ?: 0.0
+        }
+
+        TpAuraPlusHud.tick(active = phase != Phase.IDLE)
+    }
+
+    /** Whether a damage packet names the player as its cause; unattributed packets count as ours. */
+    private fun hitFromUs(packet: Any): Boolean {
+        if (packet !is ClientboundDamageEventPacket) {
+            return true
+        }
+        return packet.sourceCauseId() == player.id || packet.sourceDirectId() == player.id ||
+            (packet.sourceCauseId() <= 0 && packet.sourceDirectId() <= 0)
+    }
 
     /**
-     * Confirms the swing with the server's own word: a hurt event for the target just after it says the
-     * damage was accepted. That event carries no attacker, so the window stays short — a team fight or a
-     * burning target can answer it for someone else.
+     * Confirms the swing with the server's own word: a hurt event for the target just after the damage
+     * was accepted. It may carry no attacker on proxied servers, so the window stays short.
      */
     @Suppress("unused")
     private val hitConfirmHandler = handler<PacketEvent> { event ->
-        val waiting = awaitingHit ?: return@handler
+        val waiting = awaitingHit
 
         val hurtId = when (val packet = event.packet) {
             // What onlookers get: the damage itself, with the entity that caused it. The hurt animation
@@ -1469,7 +2037,7 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
                 // the old hurt event, which carries no attacker: both ids are -1.
                 val ours = packet.sourceCauseId() == player.id || packet.sourceDirectId() == player.id
                 val unattributed = packet.sourceCauseId() <= 0 && packet.sourceDirectId() <= 0
-                if (packet.entityId() == waiting.id && (ours || unattributed)) packet.entityId() else null
+                if (packet.entityId() == waiting?.id && (ours || unattributed)) packet.entityId() else null
             }
             // Older servers, translated by ViaFabricPlus, report a hurt through the entity event.
             is ClientboundEntityEventPacket -> if (packet.eventId == ENTITY_EVENT_HURT) {
@@ -1481,12 +2049,29 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
             else -> null
         }
 
-        if (hurtId != waiting.id) {
+        // Only the target matters here: logging every hurt in the world turns the file into megabytes
+        // of noise, and the interesting case is a packet that arrives when nothing is awaited.
+        val relevant = hurtId != null && (hurtId == waiting?.id || hurtId == watchedTarget?.id)
+        if (relevant) {
+            dlog(
+                "DMG",
+                TpAuraPlusLog.details(
+                    "packet" to event.packet.javaClass.simpleName,
+                    "entity" to hurtId,
+                    "awaiting" to waiting?.id,
+                    "mine" to hitFromUs(event.packet),
+                    "tick" to ticks,
+                ),
+            )
+        }
+
+        if (hurtId == null || waiting == null || hurtId != waiting.id) {
             return@handler
         }
 
         awaitingHit = null
         dlog("HIT-CONFIRMED", TpAuraPlusLog.details("target" to desc(waiting)))
+        TpAuraPlusHud.onResult(true)
         sfx(sfx.hitSuccess, SFX_HIT)
     }
 
@@ -1507,13 +2092,13 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     }
 
     private fun dlog(event: String, details: String = "") {
-        if (debug) {
+        if (debug.log) {
             TpAuraPlusLog.log(ticks, event, details)
         }
     }
 
     private fun dchat(text: String) {
-        if (debug) {
+        if (debug.log) {
             chat("[TpAuraPlus] $text", this)
         }
     }
@@ -1553,6 +2138,52 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
 
     private const val REACH_MARGIN = 0.1
     private const val TARGET_MOVEMENT_MARGIN = 0.4
+
+    // Reach as the server measures it, per protocol generation:
+    //
+    //   1.8 – 1.20.4   hasLineOfSight ? 36.0 : 9.0   (a ray from our eyes to the target's eyes)
+    //   1.20.5 and up  only the entityInteractionRange attribute, default 3.0, no sight bonus
+    //
+    // The sight rule therefore only holds on the older servers, which is where HvH happens. On a modern
+    // server the six would let the module plan swings the server drops; without the spray the reach is
+    // read straight from the attribute anyway, so the ordinary path is unaffected.
+
+    /** Ticks of searching before a pin that the client disagrees with is treated as fiction. */
+    private const val RESYNC_AFTER = 8
+
+    /** How far the predicted anchor may drift before a cached goal set is thrown away. */
+    private const val GOAL_DRIFT = 10.0
+
+    /** Ticks between two retargets of a running search. */
+    private const val RETARGET_COOLDOWN = 3
+
+    /** How many ticks a route search may take before it counts as stuck rather than slow. */
+    private const val SEARCH_PATIENCE = 10
+
+    /** Ticks between the teleport and the swing, long enough for the server to take the move. */
+    private const val SWING_DELAY = 1
+
+    /** How long a return may take before the run is written off and the position handed back. */
+    private const val RETURN_PATIENCE = 40
+
+    /** How far the client and the server may drift apart, and for how long, before a forced resync. */
+    private const val DESYNC_GAP = 12.0
+    private const val DESYNC_PATIENCE = 20
+
+    /**
+     * How long a teleport pin lasts. It only has to hold until the swing goes out; a pin that outlives
+     * the swing keeps rewriting the client's own movement, and the player appears stuck for its duration.
+     */
+    private const val TELEPORT_PIN_TICKS = 3
+
+    /** Distance allowed when the sight line to the target's eyes is blocked. */
+    private const val BLIND_REACH = 3.0
+
+    /** Distance allowed with a clear sight line, the 36.0 of the older servers squared. */
+    private const val SIGHTED_REACH = 6.0
+
+    /** Probe spacing as a fraction of the coverage two reaches give, leaving room for the swing itself. */
+    private const val SPRAY_COVERAGE = 0.9
     private const val ROUTE_DETOUR = 2.0
 
     /** Ticks the click may delay the dispatch before the flight leaves without it. */
@@ -1585,9 +2216,9 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     /** The aggressive spray: a chain of probe spots along the target's path, its height included. */
     private const val PROBE_TICKS = 2.0
     private const val PROBE_PING_CAP = 2.0
-    private const val CHAIN_STEP = 2.5
-    private const val CHAIN_MAX = 4
-    private const val MAX_PROBES = 8
+
+    /** How far back along the target's path the spray reaches, covering the server's own lag. */
+    private const val PROBE_BACK = 2.0
 
     /** `LivingEntity` broadcasts this entity event on every accepted damage: the red flash and hurt time. */
     private const val ENTITY_EVENT_HURT: Byte = 2
@@ -1614,11 +2245,16 @@ object ModuleTpAuraPlus : ClientModule("TpAuraPlus", ModuleCategories.COMBAT, di
     /** How much of the measured turn is applied to the lead — most targets do not circle cleanly. */
     private const val TURN_DAMP = 0.9
 
+    /** Beyond this much turning per tick the path is a corner, not an arc, and the arc model is dropped. */
+    private const val SHARP_TURN = 0.35
+
     /** The lead never follows more than this much turning; beyond it the extrapolation lies. */
     private const val MAX_TURN = 0.7
 
+    /** The shortest lead that still makes sense; below it the aim sits on the target's current spot. */
+    private const val MIN_LEAD = 1.0
+
     /** Ticks between the flight ending and the swing going out. */
-    private const val STATE_TICKS = 1.0
 
     /** Foliage blocks a sight check may pass through before a real wall counts. */
     private const val MAX_SIGHT_SKIPS = 3

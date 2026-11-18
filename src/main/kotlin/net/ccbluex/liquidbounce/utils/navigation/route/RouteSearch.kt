@@ -59,4 +59,22 @@ class RouteLimits(
     val maxExpansions: Int = 8_000,
     val expansionsPerSlice: Int = 400,
     val maxComputeNanos: Long = TimeUnit.MILLISECONDS.toNanos(150),
-)
+) {
+
+    companion object {
+
+        /** Limits for [maxLength], with [explorationScale] widening the search budget for hard terrain. */
+        fun forLength(maxLength: Double, explorationScale: Double = 1.0): RouteLimits =
+            if (explorationScale == 1.0) {
+                RouteLimits(maxLength)
+            } else {
+                RouteLimits(
+                    maxLength = maxLength,
+                    maxExpansions = (8_000 * explorationScale).toInt(),
+                    expansionsPerSlice = (400 * explorationScale).toInt(),
+                    maxComputeNanos = (150_000_000L * explorationScale).toLong(),
+                )
+            }
+
+    }
+}

@@ -72,15 +72,28 @@ object TeleportManager : EventListener {
 
     fun holds(owner: EventListener) = holder === owner
 
-    /** Notes a position the server accepted outside of a run, so the way back starts from there too. */
-    fun notePosition(position: Vec3, onGround: Boolean) {
+    /**
+     * Notes a position the server accepted outside of a run, so the way back starts from there too.
+     * [ttl] bounds how long the tracked position keeps the client's own movement from going out.
+     */
+    fun notePosition(position: Vec3, onGround: Boolean, ttl: Int = MAX_PIN_TICKS) {
         lastSent = Route.Step(position, onGround, 0)
-        pinTtl = MAX_PIN_TICKS
+        pinTtl = ttl
     }
 
     /** Drops a tracked position that no run owns, so the client's own movement is sent again. */
     fun releasePosition() {
         if (holder == null) {
+            release()
+        }
+    }
+
+    /**
+     * Drops a tracked position even when a run owns it. For an owner that has given up: a run left
+     * half finished keeps rewriting the client's movement and the player never gets control back.
+     */
+    fun forceRelease(owner: EventListener) {
+        if (holds(owner)) {
             release()
         }
     }
