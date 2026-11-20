@@ -53,7 +53,7 @@ internal class HudValueGroup : ValueGroup("Hud") {
     val phase by boolean("ShowPhase", true)
     val target by boolean("ShowTarget", true)
     val lead by boolean("ShowLead", true)
-    val flightEma by boolean("ShowFlightEma", true, aliases = listOf("ShowLatency"))
+    val reqAttack by boolean("ShowReqAttack", true, aliases = listOf("ShowFlightEma", "ShowLatency"))
     val hitRate by boolean("ShowHitRate", true)
     val health by boolean("ShowHealth", true)
     val damage by boolean("ShowDamage", true)
@@ -112,7 +112,7 @@ internal object TpAuraPlusHud {
     var target: String? = null
     var distance: Double = 0.0
     var lead: Double = 0.0
-    var flightEma: Double = 0.0
+    var reqAttack: Double = 0.0
     var pinGap: Double = 0.0
     var targetHealth: Double = 0.0
     var targetMaxHealth: Double = 0.0
@@ -136,7 +136,7 @@ internal object TpAuraPlusHud {
         val target: String?,
         val distance: Double,
         val lead: Double,
-        val flightEma: Double,
+        val reqAttack: Double,
         val pinGap: Double,
         val health: Double,
         val maxHealth: Double,
@@ -219,7 +219,7 @@ internal object TpAuraPlusHud {
         target = target,
         distance = distance,
         lead = lead,
-        flightEma = flightEma,
+        reqAttack = reqAttack,
         pinGap = pinGap,
         health = targetHealth,
         maxHealth = targetMaxHealth,
@@ -307,7 +307,7 @@ internal object TpAuraPlusHud {
         target = null,
         distance = 0.0,
         lead = 0.0,
-        flightEma = 0.0,
+        reqAttack = 0.0,
         pinGap = 0.0,
         health = 0.0,
         maxHealth = 0.0,
@@ -345,11 +345,15 @@ internal object TpAuraPlusHud {
         addRow(rows, header)
 
         val stats = ArrayList<Part>()
-        if (config.lead) {
+        // Zero means "no lead in use" (prediction off): keeping the row would show a number that
+        // nothing in the flight actually uses.
+        if (config.lead && shown.lead > 0.0) {
             stats += text("lead ${fmt(shown.lead)} t", HIT)
         }
-        if (config.flightEma) {
-            stats += text("flightEMA ${fmt(shown.flightEma)} t", MUTED)
+        if (config.reqAttack) {
+            // "request → attack": the whole approach, from asking for the route to standing on the spot.
+            // ASCII arrow on purpose — the default font has no U+2192 and would draw a missing glyph.
+            stats += text("req->attack ${fmt(shown.reqAttack)} t", MUTED)
         }
         if (config.hitRate && shown.samples > 0) {
             stats += text("hit ${shown.hitRate}%  (${shown.samples})", if (shown.hitRate >= 60) HIT else MISS)
